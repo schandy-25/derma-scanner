@@ -1,6 +1,7 @@
 # app.py
 import os
 import io
+import tempfile
 from datetime import datetime
 from typing import Dict, Tuple
 
@@ -12,28 +13,6 @@ from reportlab.lib import colors
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 from fastapi import FastAPI
-
-import tempfile
-import os
-from datetime import datetime
-
-def on_click(img):
-    if img is None:
-        return ("Upload an image to begin.",
-                "Tip: dermatoscopic close-ups work best.",
-                None, None, None)
-
-    title, body, plot_df, table_df, pdf_bytes = run_inference(img)
-
-    # Write PDF to a real file (Gradio expects a path for gr.File output)
-    ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
-    tmpdir = tempfile.gettempdir()
-    pdf_path = os.path.join(tmpdir, f"derma_scanner_report_{ts}.pdf")
-    with open(pdf_path, "wb") as f:
-        f.write(pdf_bytes)
-
-    return title, body, plot_df, table_df, pdf_path
-
 
 # ---- runtime mode & port ----
 PORT = int(os.getenv("PORT", "7860"))
@@ -97,7 +76,7 @@ def make_pdf(image: Image.Image, probs_df: pd.DataFrame, headline: str, subtext:
     c.drawString(40, height - 80, f"Generated: {datetime.utcnow().isoformat(timespec='seconds')}Z")
     c.drawString(40, height - 95, "Dataset base: HAM10000 · This tool is not a medical device.")
 
-    # image
+    # image (wrap PIL with ImageReader)
     img_w, img_h = 260, 260
     img_reader = ImageReader(image.convert("RGB").resize((img_w, img_h)))
     c.drawImage(img_reader, 40, height - 370, width=img_w, height=img_h,
@@ -181,12 +160,10 @@ def build_gradio():
 
         with gr.Row():
             with gr.Column(scale=5):
-                image_in = gr.Image(
-                    type="pil",
-                    image_mode="RGB",
-                    sources=["upload"],   # upload-only avoids webcam path
-                    label="Upload dermatoscopic image",
-                    height=360,
+                # Use File input to avoid upload_progress issues
+                file_in = gr.File(
+                    label="Upload dermatoscopic image (PNG/JPG)",
+                    file_types=[".png", ".jpg", ".jpeg"]
                 )
                 analyze_btn = gr.Button("🔍 Analyze Image", variant="primary")
                 gr.Markdown(DISCLAIMER)
@@ -210,19 +187,26 @@ def build_gradio():
                 )
                 pdf_out = gr.File(label="Download PDF report", file_types=[".pdf"])
 
-        def on_click(img):
-            if img is None:
+        def on_click(file_obj):
+            if file_obj is None:
                 return ("Upload an image to begin.",
                         "Tip: dermatoscopic close-ups work best.",
                         None, None, None)
+            # file_obj is a dict-like with .name path
+            img = Image.open(file_obj.name).convert("RGB")
             title, body, plot_df, table_df, pdf_bytes = run_inference(img)
-            pdf_io = io.BytesIO(pdf_bytes)
-            pdf_io.name = f"derma_scanner_report_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.pdf"
-            return title, body, plot_df, table_df, pdf_io
+
+            # Write PDF to a real temp file and return its path (what gr.File expects)
+            ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+            pdf_path = os.path.join(tempfile.gettempdir(), f"derma_scanner_report_{ts}.pdf")
+            with open(pdf_path, "wb") as f:
+                f.write(pdf_bytes)
+
+            return title, body, plot_df, table_df, pdf_path
 
         analyze_btn.click(
             fn=on_click,
-            inputs=[image_in],
+            inputs=[file_in],
             outputs=[result_title, result_body, bar, table, pdf_out]
         )
     return demo
@@ -238,8 +222,8 @@ def predict_api():
 
 def run_gradio():
     demo = build_gradio()
-    # remove queue=False
     demo.launch(server_name="0.0.0.0", server_port=PORT, show_api=False, share=False)
+
 def run_api():
     import uvicorn
     uvicorn.run(api, host="0.0.0.0", port=8000)
