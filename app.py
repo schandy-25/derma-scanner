@@ -13,6 +13,28 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 from fastapi import FastAPI
 
+import tempfile
+import os
+from datetime import datetime
+
+def on_click(img):
+    if img is None:
+        return ("Upload an image to begin.",
+                "Tip: dermatoscopic close-ups work best.",
+                None, None, None)
+
+    title, body, plot_df, table_df, pdf_bytes = run_inference(img)
+
+    # Write PDF to a real file (Gradio expects a path for gr.File output)
+    ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+    tmpdir = tempfile.gettempdir()
+    pdf_path = os.path.join(tmpdir, f"derma_scanner_report_{ts}.pdf")
+    with open(pdf_path, "wb") as f:
+        f.write(pdf_bytes)
+
+    return title, body, plot_df, table_df, pdf_path
+
+
 # ---- runtime mode & port ----
 PORT = int(os.getenv("PORT", "7860"))
 APP_MODE = os.getenv("APP_MODE") or ("gradio" if os.getenv("SPACE_ID") else "gradio")
