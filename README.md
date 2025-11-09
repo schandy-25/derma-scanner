@@ -21,7 +21,7 @@
 - **Docker** (optional, for containerized deployment)
 
 ## Architecture Diagram
-```mermaid
+```
 flowchart LR
     A[Browser / Client] -- upload image --> B[Gradio UI]
     A -- POST /predict --> C[FastAPI]
