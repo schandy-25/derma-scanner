@@ -178,7 +178,8 @@ def build_gradio():
 
         with gr.Row():
             with gr.Column(scale=5):
-                image_in = gr.Image(type="pil", label="Upload dermatoscopic image", height=360)
+                image_in = gr.Image(type="pil", image_mode="RGB", sources=["upload"], label="Upload dermatoscopic image", height=360)
+
                 analyze_btn = gr.Button("🔍 Analyze Image", variant="primary")
                 gr.Markdown(DISCLAIMER)
             with gr.Column(scale=7):
