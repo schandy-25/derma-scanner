@@ -1,296 +1,257 @@
-# app.py — Derma Scanner with friendly labels, no webcam, PDF report, FastAPI + Gradio
+# app.py
 import os
-APP_MODE = os.getenv("APP_MODE") or ("gradio" if os.getenv("SPACE_ID") else "both")
-PORT = int(os.getenv("PORT", "7860"))
+import io
+from datetime import datetime
+from typing import Dict, Tuple
 
-import threading
-from io import BytesIO
-from tempfile import NamedTemporaryFile
-
-import pandas as pd
 import gradio as gr
+import pandas as pd
 from PIL import Image
-from fastapi import FastAPI, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-
-# PDF generation
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.pdfgen import canvas
+from fastapi import FastAPI
 
-from src.infer import Predictor
+# --- runtime mode & port ---
+PORT = int(os.getenv("PORT", "7860"))
+APP_MODE = os.getenv("APP_MODE") or ("gradio" if os.getenv("SPACE_ID") else "gradio")
 
-# ---------------------
-# Model / Predictor
-# ---------------------
-predictor = Predictor()  # expects models/derma_scanner_efficientnet_b0.pth + src/labels.json
+# --- model predictor (lazy init) ---
+PREDICTOR = None
+def get_predictor():
+    global PREDICTOR
+    if PREDICTOR is None:
+        from src.infer import Predictor  # lazy to speed cold start logs
+        PREDICTOR = Predictor()
+    return PREDICTOR
 
-# Human-friendly info per HAM10000 code (very short, non-medical)
-CLASS_INFO = {
-    "akiec": {"name": "Actinic keratosis / Intraepithelial carcinoma", "short": "Sun-damaged or early pre-cancer changes on the skin.", "severity": "caution"},
-    "bcc":   {"name": "Basal cell carcinoma (BCC)",                      "short": "Common skin cancer; usually slow-growing and treatable.", "severity": "caution"},
-    "bkl":   {"name": "Benign keratosis-like lesion",                    "short": "Typically harmless age-related spot (seborrheic keratosis).", "severity": "ok"},
-    "df":    {"name": "Dermatofibroma",                                  "short": "Usually harmless small, firm bump under the skin.", "severity": "ok"},
-    "mel":   {"name": "Melanoma",                                        "short": "Serious skin cancer — early check by a clinician is important.", "severity": "urgent"},
-    "nv":    {"name": "Melanocytic nevus (mole)",                        "short": "Common mole; often harmless.", "severity": "ok"},
-    "vasc":  {"name": "Vascular lesion",                                 "short": "Blood-vessel related spot (e.g., angioma); often harmless.", "severity": "ok"},
+# --- code -> human label mapping for HAM10000 ---
+CODE2HUMAN = {
+    "akiec": "Actinic keratosis / Intraepithelial carcinoma",
+    "bcc":   "Basal cell carcinoma (BCC)",
+    "bkl":   "Benign keratosis-like lesion",
+    "df":    "Dermatofibroma",
+    "mel":   "Melanoma",
+    "nv":    "Melanocytic nevus (mole)",
+    "vasc":  "Vascular lesion",
 }
 
-# Heuristic for “looks healthy” banner (NOT a diagnosis)
-HEALTHY_CLASS = "nv"
-HEALTHY_THRESHOLD = 0.85  # 85% confidence
+# --- triage text by risk (very rough, non-diagnostic) ---
+LOW_RISK   = {"nv", "bkl", "df", "vasc"}
+MED_RISK   = {"bcc", "akiec"}
+HIGH_RISK  = {"mel"}
 
-# Theme colors (white + red)
-PRIMARY = "#e11d48"       # red-600
-PRIMARY_DARK = "#be123c"  # red-700
-BG = "#ffffff"
-TEXT = "#111827"          # neutral-900
-MUTED = "#6b7280"         # neutral-500
-OK_BG = "#16a34a"         # green-600
-CAUTION_BG = "#f59e0b"    # amber-500
-URGENT_BG = "#ef4444"     # red-500
-
-def severity_badge(sev: str) -> str:
-    color = {"ok": OK_BG, "caution": CAUTION_BG, "urgent": URGENT_BG}.get(sev, CAUTION_BG)
-    label = {"ok": "Likely Benign", "caution": "Consultation Recommended", "urgent": "Urgent Check Advised"}.get(sev, "Consultation Recommended")
-    return (
-        f'<span style="background:{color};color:white;padding:4px 10px;'
-        f'border-radius:9999px;font-weight:600;font-size:12px;letter-spacing:.02em">{label}</span>'
-    )
-
-# ---------------------
-# Core: predict + friendly message + table + help + pdf
-# ---------------------
-def _build_help_html() -> str:
-    rows = []
-    for code, meta in CLASS_INFO.items():
-        rows.append(
-            f"<tr>"
-            f"<td style='padding:6px 8px;font-weight:600;color:{TEXT}'>{meta['name']}</td>"
-            f"<td style='padding:6px 8px;color:{MUTED}'><code>{code.upper()}</code></td>"
-            f"<td style='padding:6px 8px;color:{TEXT}'>{meta['short']}</td>"
-            f"</tr>"
-        )
-    return f"""
-    <div style="border:1px solid #e5e7eb;border-radius:12px;padding:12px;margin-top:8px">
-      <div style="font-weight:800;color:{TEXT};margin-bottom:8px">What do these labels mean?</div>
-      <table style="width:100%;border-collapse:collapse">
-        <thead>
-          <tr style="background:#fafafa">
-            <th style="text-align:left;padding:6px 8px;color:{MUTED};font-weight:700">Friendly name</th>
-            <th style="text-align:left;padding:6px 8px;color:{MUTED};font-weight:700">Code</th>
-            <th style="text-align:left;padding:6px 8px;color:{MUTED};font-weight:700">Short description</th>
-          </tr>
-        </thead>
-        <tbody>
-          {''.join(rows)}
-        </tbody>
-      </table>
-    </div>
-    """
-
-HELP_HTML = _build_help_html()
-
-def _generate_pdf(top_name: str, top_pct: float, sev_label: str, df: pd.DataFrame) -> str:
-    """Create a one-page PDF report and return its file path."""
-    tmp = NamedTemporaryFile(delete=False, suffix=".pdf")
-    tmp.close()
-    doc = SimpleDocTemplate(tmp.name, pagesize=A4, title="Derma Scanner Report")
-    styles = getSampleStyleSheet()
-    story = []
-
-    title = f"Derma Scanner — Result"
-    sub = f"Top guess: {top_name} ({top_pct*100:.1f}%) — {sev_label}"
-    disclaimer = ("This document is generated by an educational demo using the HAM10000 dataset. "
-                  "It is NOT a medical diagnosis. Always consult a licensed clinician.")
-
-    story.append(Paragraph(title, styles["Title"]))
-    story.append(Spacer(1, 8))
-    story.append(Paragraph(sub, styles["Heading3"]))
-    story.append(Spacer(1, 8))
-    story.append(Paragraph(disclaimer, styles["BodyText"]))
-    story.append(Spacer(1, 12))
-
-    table_data = [["Label (human)", "Code", "Probability (%)"]] + [
-        [str(r["label (human)"]), str(r["code"]), f'{float(r["probability (%)"]):.1f}']
-        for _, r in df.iterrows()
-    ]
-    tbl = Table(table_data, repeatRows=1)
-    tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f3f4f6")),
-        ("TEXTCOLOR", (0,0), (-1,0), colors.black),
-        ("ALIGN", (0,0), (-1,-1), "LEFT"),
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-        ("BOTTOMPADDING", (0,0), (-1,0), 8),
-        ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor("#e5e7eb")),
-    ]))
-    story.append(tbl)
-    doc.build(story)
-    return tmp.name
-
-def predict_all(img: Image.Image):
-    """
-    Returns:
-      msg_html, table_df, help_html, pdf_path
-    """
-    res = predictor.predict(img)  # {"top_class": str, "probs": {cls: prob}}
-
-    # Build tidy DataFrame with friendly labels
-    df = (
-        pd.DataFrame.from_dict(res["probs"], orient="index", columns=["prob"])
-          .reset_index(names="code")
-    )
-    df["label (human)"] = df["code"].map(lambda c: CLASS_INFO.get(c, {}).get("name", c.upper()))
-    df["probability (%)"] = (df["prob"] * 100).round(1)
-    df = df[["label (human)", "code", "probability (%)"]].sort_values("probability (%)", ascending=False).reset_index(drop=True)
-
-    # Top prediction & message
-    top_code = str(df.iloc[0]["code"])
-    top_pct = float(df.iloc[0]["probability (%)"]) / 100.0
-    info = CLASS_INFO.get(top_code, {"name": top_code.upper(), "short": "", "severity": "caution"})
-    top_name = info["name"]
-    sev = info["severity"]
-
-    if top_code == HEALTHY_CLASS and top_pct >= HEALTHY_THRESHOLD:
-        headline = "🎉 Your skin looks healthy!!!"
-        sub = f"Our model is {top_pct*100:.1f}% confident it looks like {top_name}."
-        advisory = "This is a research demo — if you notice changes or have concerns, please consult a clinician."
-        sev = "ok"
+def triage_message(top_code: str, conf: float) -> Tuple[str, str]:
+    pct = f"{conf:.1f}%"
+    human = CODE2HUMAN.get(top_code, top_code.upper())
+    if top_code in HIGH_RISK:
+        title = "⚠️ Urgent: Consultation Recommended"
+        body  = f"Top finding: **{human}** with **{pct}** confidence. This could be serious—please consult a dermatologist promptly."
+    elif top_code in MED_RISK:
+        title = "🩺 Consultation Recommended"
+        body  = f"Top finding: **{human}** with **{pct}** confidence. Please have a dermatologist review."
     else:
-        if sev == "urgent":
-            headline = "🚩 Please get this checked soon (not a diagnosis)"
-        elif sev == "ok":
-            headline = "👍 Likely benign (not a diagnosis)"
-        else:
-            headline = "🩺 You likely have this (not a diagnosis)"
-        sub = f"Top guess: {top_name} ({top_pct*100:.1f}%)."
-        advisory = "Please consult a dermatologist for expert evaluation."
+        title = "✅ Likely Benign (not a diagnosis)"
+        body  = f"Top finding: **{human}** with **{pct}** confidence. Your skin looks okay from this image, but this is **not** a medical diagnosis."
+    return title, body
 
-    badge_html = severity_badge(sev)
-    msg_html = f"""
-    <div style="background:{BG};border:1px solid #e5e7eb;border-radius:16px;padding:18px;box-shadow:0 2px 8px rgba(0,0,0,0.04)">
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">{badge_html}</div>
-      <div style="font-size:22px;font-weight:800;color:{TEXT};margin-bottom:6px">{headline}</div>
-      <div style="font-size:16px;color:{TEXT};margin-bottom:10px">{sub}</div>
-      <div style="font-size:14px;color:{MUTED}">{advisory}</div>
-    </div>
-    """
+# --- PDF report generation ---
+def make_pdf(image: Image.Image, probs_df: pd.DataFrame, headline: str, subtext: str) -> bytes:
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
 
-    # PDF report
-    sev_label = {"ok": "Likely Benign", "caution": "Consultation Recommended", "urgent": "Urgent Check Advised"}[sev]
-    pdf_path = _generate_pdf(top_name, top_pct, sev_label, df)
+    # Header
+    c.setFillColor(colors.HexColor("#b30000"))  # dark red
+    c.rect(0, height-60, width, 60, fill=1, stroke=0)
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(40, height-40, "Derma Scanner — Non-diagnostic AI Report")
 
-    return msg_html, df, HELP_HTML, pdf_path
+    # Meta
+    c.setFillColor(colors.black)
+    c.setFont("Helvetica", 10)
+    c.drawString(40, height-80, f"Generated: {datetime.utcnow().isoformat(timespec='seconds')}Z")
+    c.drawString(40, height-95, "Dataset base: HAM10000 · This tool is not a medical device.")
 
-# ---------------------
-# Gradio UI (Blocks) — upload only, no webcam
-# ---------------------
-CUSTOM_CSS = f"""
-.gradio-container {{ background: {BG}; }}
-.header-card {{
-  border: 1px solid #e5e7eb; background: #fff; border-radius: 20px;
-  padding: 22px 24px; box-shadow: 0 4px 14px rgba(0,0,0,0.06);
-}}
-.header-title {{ font-size: 28px; font-weight: 900; color: {TEXT}; margin-bottom: 6px; }}
-.header-sub {{ color: {MUTED}; font-size: 15px; }}
-.action-btn {{ background: {PRIMARY}; color: white !important; border: none; }}
-.action-btn:hover {{ background: {PRIMARY_DARK}; color: white !important; }}
-.footer-note {{ color: {MUTED}; font-size: 12px; }}
+    # Image (scaled)
+    img_w = 260
+    img_h = 260
+    image_resized = image.convert("RGB").resize((img_w, img_h))
+    img_bytes = io.BytesIO()
+    image_resized.save(img_bytes, format="PNG")
+    img_bytes.seek(0)
+    c.drawImage(img_bytes, 40, height-370, width=img_w, height=img_h, preserveAspectRatio=True, mask='auto')
+
+    # Headline
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(320, height-130, headline)
+    c.setFont("Helvetica", 11)
+    text = c.beginText(320, height-150)
+    text.textLines(subtext)
+    c.drawText(text)
+
+    # Table of top 7 classes
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(40, height-410, "Class probabilities")
+    c.setFont("Helvetica", 10)
+
+    # Table headers
+    y = height - 430
+    c.setFillColor(colors.black)
+    c.drawString(40,  y, "Label (human)")
+    c.drawString(320, y, "Code")
+    c.drawString(400, y, "Probability (%)")
+    c.line(40, y-3, 520, y-3)
+
+    y -= 18
+    for _, row in probs_df.iterrows():
+        if y < 60:
+            c.showPage()
+            y = height - 60
+        c.drawString(40,  y, str(row["label (human)"])[:45])
+        c.drawString(320, y, str(row["code"]))
+        c.drawRightString(520, y, f'{row["probability (%)"]:.2f}')
+        y -= 16
+
+    # Footer disclaimer
+    c.setFont("Helvetica-Oblique", 9)
+    c.setFillColor(colors.gray)
+    c.drawString(40, 40, "Disclaimer: Educational demo. Not for diagnosis, screening, or treatment decisions.")
+    c.save()
+    buf.seek(0)
+    return buf.read()
+
+# --- core inference ---
+def run_inference(image: Image.Image) -> Tuple[str, str, pd.DataFrame, pd.DataFrame, bytes]:
+    predictor = get_predictor()
+    result = predictor.predict(image)  # {"top_class": code, "probs": {code: float, ...}}
+
+    probs: Dict[str, float] = result["probs"]
+    # Build DataFrame
+    rows = []
+    for code, p in probs.items():
+        rows.append({
+            "label (human)": CODE2HUMAN.get(code, code.upper()),
+            "code": code,
+            "probability (%)": round(p * 100.0, 4),
+        })
+    df = pd.DataFrame(rows).sort_values("probability (%)", ascending=False).reset_index(drop=True)
+
+    # BarPlot expects a tidy frame
+    plot_df = df.copy()
+
+    # Top class & triage
+    top_code = result["top_class"]
+    top_pct  = float(probs[top_code] * 100.0)
+    title, body = triage_message(top_code, top_pct)
+
+    # PDF
+    pdf_bytes = make_pdf(image, df, headline=title, subtext=body)
+
+    return title, body, plot_df, df, pdf_bytes
+
+# --- UI building ---
+RED = "#b30000"
+LIGHT_RED = "#ffe6e6"
+WHITE = "#ffffff"
+BG = "#ffffff"
+
+INTRO_HTML = f"""
+<div style="background:linear-gradient(90deg,{RED} 0%, {RED} 60%, #d11a2a 100%); color:{WHITE}; padding:22px; border-radius:14px; margin-bottom:16px;">
+  <h1 style="margin:0; font-size:26px;">Derma Scanner</h1>
+  <p style="margin:6px 0 0 0; font-size:14px;">
+    Upload a dermatoscopic image to get class probabilities for common skin lesions (HAM10000 classes).
+    <b>This is not a diagnosis.</b> Always consult a dermatologist for medical advice.
+  </p>
+</div>
+"""
+
+DISCLAIMER = """
+**Medical disclaimer:** This demo is for educational purposes only. It is **not** a medical device and does **not**
+provide diagnoses. If you have concerns, consult a qualified healthcare professional.
 """
 
 def build_gradio():
-    with gr.Blocks(css=CUSTOM_CSS) as demo:
-        # Header
-        with gr.Row():
-            with gr.Column(scale=2):
-                gr.HTML(f"""
-                <div class="header-card">
-                  <div class="header-title">Derma Scanner</div>
-                  <div class="header-sub">
-                    Upload a dermatoscopic image to get a machine-learning guess about the lesion type.
-                    <br><strong style="color:{PRIMARY}">Not a medical device</strong> — results are informational only.
-                  </div>
-                </div>
-                """)
-        gr.Markdown("---")
+    with gr.Blocks(theme=gr.themes.Soft(primary_hue="red"), css=f"body{{background:{BG};}} .container{{max-width:1080px; margin:auto;}}") as demo:
+        gr.HTML(INTRO_HTML)
 
-        # Main
         with gr.Row():
-            with gr.Column(scale=1):
-                img = gr.Image(
-                    type="pil",
-                    sources=["upload"],   # upload-only; no webcam
-                    label="Upload dermatoscopic image"
+            with gr.Column(scale=5):
+                image_in = gr.Image(type="pil", label="Upload dermatoscopic image", height=360)
+                analyze_btn = gr.Button("🔍 Analyze Image", variant="primary")
+                gr.Markdown(DISCLAIMER)
+            with gr.Column(scale=7):
+                result_title = gr.Markdown("", elem_id="headline")
+                result_body = gr.Markdown("")
+                bar = gr.BarPlot(
+                    value=None,
+                    x="label (human)", y="probability (%)",
+                    title="Class probabilities",
+                    tooltip=["code", "probability (%)"],
+                    y_lim=[0, 100],
+                    width=700,
+                    interactive=False,
                 )
-                btn = gr.Button("Analyze Image", elem_classes=["action-btn"])
-            with gr.Column(scale=1):
-                msg = gr.HTML(label="Result")
                 table = gr.Dataframe(
                     headers=["label (human)", "code", "probability (%)"],
-                    label="Class probabilities",
-                    datatype=["str", "str", "number"],
-                    interactive=False,
-                    wrap=True,
-                    row_count=(7, "fixed"),
-                    col_count=3
+                    row_count=7,
+                    col_count=(3, "fixed"),
+                    label="Class probabilities (table)"
                 )
-                help_panel = gr.HTML(label="About the labels")
-                pdf_file = gr.File(label="Download PDF report", interactive=False)
+                pdf_out = gr.File(label="Download PDF report", file_types=[".pdf"])
 
-        # Single callback populates ALL three (no duplicate renders)
-        btn.click(fn=predict_all, inputs=img, outputs=[msg, table, help_panel, pdf_file])
+        def on_click(img):
+            if img is None:
+                return ("Upload an image to begin.",
+                        "Tip: dermatoscopic close-ups work best.",
+                        None, None, None)
+            title, body, plot_df, table_df, pdf_bytes = run_inference(img)
+            # Save PDF to a temp in-memory file for Gradio to serve
+            pdf_io = io.BytesIO(pdf_bytes)
+            pdf_io.name = f"derma_scanner_report_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.pdf"
+            return title, body, plot_df, table_df, pdf_io
 
-        gr.Markdown("---")
-        gr.HTML(f"""
-        <div class="footer-note">
-          ⚠️ <strong>Medical disclaimer:</strong> This demo is for research and educational use only.
-          It does not provide diagnoses. Always consult a licensed clinician for medical advice.
-        </div>
-        """)
+        analyze_btn.click(
+            fn=on_click,
+            inputs=[image_in],
+            outputs=[result_title, result_body, bar, table, pdf_out]
+        )
+
     return demo
 
-# ---------------------
-# FastAPI for programmatic usage (unchanged)
-# ---------------------
-api = FastAPI(title="Derma Scanner API", version="1.0.0")
-api.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
-)
+# --- (optional) simple API for programmatic use ---
+api = FastAPI(title="Derma Scanner API")
 
 @api.get("/health")
 def health():
     return {"status": "ok"}
 
 @api.post("/predict")
-async def predict(file: UploadFile = File(...)):
-    image_bytes = await file.read()
-    img = Image.open(BytesIO(image_bytes))
-    msg_html, df, help_html, pdf_path = predict_all(img)
-    probs = [
-        {"label": str(r["label (human)"]), "code": str(r["code"]), "probability_pct": float(r["probability (%)"])}
-        for _, r in df.iterrows()
-    ]
-    return {"message_html": msg_html, "probs": probs, "help_html": help_html, "top": probs[0] if probs else None}
+def predict_api():
+    # Minimal stub (extend to accept files if you want API mode)
+    return {"detail": "Use the Gradio UI for now."}
 
-# ---------------------
-# Launch helpers
-# ---------------------
 def run_gradio():
     demo = build_gradio()
     demo.launch(server_name="0.0.0.0", server_port=PORT, share=False, show_api=False)
 
-
-def run_fastapi():
+def run_api():
+    import uvicorn
     uvicorn.run(api, host="0.0.0.0", port=8000)
 
+# --- main ---
 if __name__ == "__main__":
     if APP_MODE == "gradio":
         run_gradio()
     elif APP_MODE == "api":
         run_api()
+    elif APP_MODE == "both":
+        # optional local mode: run both in threads
+        import threading
+        t1 = threading.Thread(target=run_api, daemon=True)
+        t2 = threading.Thread(target=run_gradio, daemon=True)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
     else:
-        run_both()
+        run_gradio()
