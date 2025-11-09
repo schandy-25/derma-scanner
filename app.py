@@ -57,6 +57,27 @@ def triage_message(top_code: str, conf_pct: float) -> Tuple[str, str]:
             f"Top finding: **{human}** with **{pct}** confidence. "
             "Your skin looks okay from this image, but this is **not** a medical diagnosis.")
 
+def make_summary_html(top_code: str, top_pct: float) -> str:
+    human = CODE2HUMAN.get(top_code, top_code.upper())
+    # Red badge for higher-risk classes, green for likely benign
+    risky = {"mel", "bcc", "akiec"}
+    color, note = ( "#e53935", "Consult a dermatologist" ) if top_code in risky else ( "#2e7d32", "Likely benign (not a diagnosis)" )
+    return f"""
+    <div style="border:1px solid #eee; border-radius:14px; padding:18px; background:#fff;">
+      <div style="display:flex; align-items:center; gap:12px;">
+        <div style="width:12px; height:12px; border-radius:50%; background:{color};"></div>
+        <h3 style="margin:0;">Prediction</h3>
+      </div>
+      <div style="margin-top:10px; font-size:16px;">
+        Top finding: <b>{human}</b> <span style="opacity:0.7;">({top_code.upper()})</span><br/>
+        Confidence: <b>{top_pct:.1f}%</b>
+      </div>
+      <div style="margin-top:12px; font-size:14px; color:#555;">
+        {note}. This tool is educational and <b>not</b> a medical device.
+      </div>
+    </div>
+    """
+
 # ---- PDF report ----
 def make_pdf(image: Image.Image, probs_df: pd.DataFrame, headline: str, subtext: str) -> bytes:
     buf = io.BytesIO()
@@ -160,7 +181,7 @@ def build_gradio():
 
         with gr.Row():
             with gr.Column(scale=5):
-                # Use File input to avoid upload_progress issues
+                # File input avoids upload_progress issues
                 file_in = gr.File(
                     label="Upload dermatoscopic image (PNG/JPG)",
                     file_types=[".png", ".jpg", ".jpeg"]
@@ -168,17 +189,9 @@ def build_gradio():
                 analyze_btn = gr.Button("🔍 Analyze Image", variant="primary")
                 gr.Markdown(DISCLAIMER)
             with gr.Column(scale=7):
-                result_title = gr.Markdown("")
-                result_body = gr.Markdown("")
-                bar = gr.BarPlot(
-                    value=None,
-                    x="label (human)", y="probability (%)",
-                    title="Class probabilities",
-                    tooltip=["code", "probability (%)"],
-                    y_lim=[0, 100],
-                    width=700,
-                    interactive=False,
-                )
+                result_title = gr.Markdown("")   # triage headline (kept)
+                result_body = gr.Markdown("")    # triage body (kept)
+                summary_card = gr.HTML("")       # NEW: prediction card
                 table = gr.Dataframe(
                     headers=["label (human)", "code", "probability (%)"],
                     row_count=7,
@@ -191,23 +204,28 @@ def build_gradio():
             if file_obj is None:
                 return ("Upload an image to begin.",
                         "Tip: dermatoscopic close-ups work best.",
-                        None, None, None)
-            # file_obj is a dict-like with .name path
+                        "", None, None)
+
             img = Image.open(file_obj.name).convert("RGB")
             title, body, plot_df, table_df, pdf_bytes = run_inference(img)
 
-            # Write PDF to a real temp file and return its path (what gr.File expects)
+            # Build prediction card from top class
+            top_code = table_df.iloc[0]["code"]
+            top_pct  = float(table_df.iloc[0]["probability (%)"])
+            summary_html = make_summary_html(top_code, top_pct)
+
+            # Persist PDF to a real temp file (gr.File expects a path)
             ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
             pdf_path = os.path.join(tempfile.gettempdir(), f"derma_scanner_report_{ts}.pdf")
             with open(pdf_path, "wb") as f:
                 f.write(pdf_bytes)
 
-            return title, body, plot_df, table_df, pdf_path
+            return title, body, summary_html, table_df, pdf_path
 
         analyze_btn.click(
             fn=on_click,
             inputs=[file_in],
-            outputs=[result_title, result_body, bar, table, pdf_out]
+            outputs=[result_title, result_body, summary_card, table, pdf_out]
         )
     return demo
 
