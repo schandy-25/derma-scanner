@@ -1,0 +1,16 @@
+# venv / OS
+.venv/
+__pycache__/
+.DS_Store
+
+# datasets & artifacts
+data/raw/
+data/processed/
+assets/
+*.png
+
+# notebooks cache
+.ipynb_checkpoints/
+
+# compiled
+*.pyc
