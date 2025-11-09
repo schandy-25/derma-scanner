@@ -1,3 +1,17 @@
+---
+title: Derma Scanner
+emoji: 🩺
+colorFrom: red
+colorTo: gray
+sdk: gradio
+app_file: app.py
+python_version: "3.10"
+license: mit
+pinned: false
+---
+
+# Derma Scanner
+HAM10000-based demo. **Not** a medical device; **not** a diagnosis.
 
 # Derma Scanner — HAM10000 Skin Lesion Classifier
 

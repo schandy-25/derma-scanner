@@ -1,5 +1,8 @@
 # app.py — Derma Scanner with friendly labels, no webcam, PDF report, FastAPI + Gradio
 import os
+APP_MODE = os.getenv("APP_MODE") or ("gradio" if os.getenv("SPACE_ID") else "both")
+PORT = int(os.getenv("PORT", "7860"))
+
 import threading
 from io import BytesIO
 from tempfile import NamedTemporaryFile
@@ -278,20 +281,16 @@ async def predict(file: UploadFile = File(...)):
 # ---------------------
 def run_gradio():
     demo = build_gradio()
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False, show_api=False)
+    demo.launch(server_name="0.0.0.0", server_port=PORT, share=False, show_api=False)
+
 
 def run_fastapi():
     uvicorn.run(api, host="0.0.0.0", port=8000)
 
 if __name__ == "__main__":
-    # APP_MODE: "gradio", "api", or "both" (default)
-    mode = os.getenv("APP_MODE", "both").lower()
-    if mode == "gradio":
+    if APP_MODE == "gradio":
         run_gradio()
-    elif mode == "api":
-        run_fastapi()
+    elif APP_MODE == "api":
+        run_api()
     else:
-        t1 = threading.Thread(target=run_gradio, daemon=True)
-        t2 = threading.Thread(target=run_fastapi, daemon=True)
-        t1.start(); t2.start()
-        t1.join(); t2.join()
+        run_both()
