@@ -216,8 +216,8 @@ def predict_api():
 
 def run_gradio():
     demo = build_gradio()
-    demo.launch(server_name="0.0.0.0", server_port=PORT, show_api=False, share=False, queue=False)
-
+    # remove queue=False
+    demo.launch(server_name="0.0.0.0", server_port=PORT, show_api=False, share=False)
 def run_api():
     import uvicorn
     uvicorn.run(api, host="0.0.0.0", port=8000)
