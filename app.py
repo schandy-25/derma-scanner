@@ -59,21 +59,25 @@ def triage_message(top_code: str, conf_pct: float) -> Tuple[str, str]:
 
 def make_summary_html(top_code: str, top_pct: float) -> str:
     human = CODE2HUMAN.get(top_code, top_code.upper())
-    # Red badge for higher-risk classes, green for likely benign
     risky = {"mel", "bcc", "akiec"}
-    color, note = ( "#e53935", "Consult a dermatologist" ) if top_code in risky else ( "#2e7d32", "Likely benign (not a diagnosis)" )
+    color, note = ("#dc2626", "Consult a dermatologist") if top_code in risky else ("#166534", "Likely benign (not a diagnosis)")
+    badge_bg = "#fee2e2" if top_code in risky else "#dcfce7"
     return f"""
-    <div style="border:1px solid #eee; border-radius:14px; padding:18px; background:#fff;">
-      <div style="display:flex; align-items:center; gap:12px;">
-        <div style="width:12px; height:12px; border-radius:50%; background:{color};"></div>
-        <h3 style="margin:0;">Prediction</h3>
+    <div class="card summary-card">
+      <div class="summary-head">
+        <span class="dot" style="background:{color};"></span>
+        <h3 class="summary-title">Prediction</h3>
       </div>
-      <div style="margin-top:10px; font-size:16px;">
-        Top finding: <b>{human}</b> <span style="opacity:0.7;">({top_code.upper()})</span><br/>
-        Confidence: <b>{top_pct:.1f}%</b>
-      </div>
-      <div style="margin-top:12px; font-size:14px; color:#555;">
-        {note}. This tool is educational and <b>not</b> a medical device.
+      <div class="summary-body">
+        <div class="line">
+          Top finding: <b>{human}</b> <span class="code">({top_code.upper()})</span>
+        </div>
+        <div class="line">
+          Confidence: <span class="pill" style="color:{color}; background:{badge_bg};"><b>{top_pct:.1f}%</b></span>
+        </div>
+        <div class="note">
+          {note}. This tool is educational and <b>not</b> a medical device.
+        </div>
       </div>
     </div>
     """
@@ -97,7 +101,7 @@ def make_pdf(image: Image.Image, probs_df: pd.DataFrame, headline: str, subtext:
     c.drawString(40, height - 80, f"Generated: {datetime.utcnow().isoformat(timespec='seconds')}Z")
     c.drawString(40, height - 95, "Dataset base: HAM10000 · This tool is not a medical device.")
 
-    # image (wrap PIL with ImageReader)
+    # image
     img_w, img_h = 260, 260
     img_reader = ImageReader(image.convert("RGB").resize((img_w, img_h)))
     c.drawImage(img_reader, 40, height - 370, width=img_w, height=img_h,
@@ -161,22 +165,89 @@ def run_inference(image: Image.Image):
 # ---- UI ----
 RED = "#b30000"; WHITE = "#ffffff"
 INTRO_HTML = f"""
-<div style="background:linear-gradient(90deg,{RED} 0%, {RED} 60%, #d11a2a 100%); color:{WHITE}; padding:22px; border-radius:14px; margin-bottom:16px;">
-  <h1 style="margin:0; font-size:26px;">Derma Scanner</h1>
-  <p style="margin:6px 0 0 0; font-size:14px;">
+<div class="banner">
+  <h1>Derma Scanner</h1>
+  <p>
     Upload a dermatoscopic image to get class probabilities for common skin lesions (HAM10000 classes).
     <b>This is not a diagnosis.</b> Always consult a dermatologist for medical advice.
   </p>
 </div>
 """
 DISCLAIMER = (
-    "**Medical disclaimer:** This demo is for educational purposes only. "
-    "It is **not** a medical device and does **not** provide diagnoses."
+    "<span class='muted'>Medical disclaimer:</span> This demo is for educational purposes only. "
+    "It is <b>not</b> a medical device and does <b>not</b> provide diagnoses."
 )
+
+CUSTOM_CSS = f"""
+:root {{
+  --brand: {RED};
+  --text: #1f2937;        /* slate-800 */
+  --text-muted: #6b7280;  /* slate-500 */
+  --card: #ffffff;
+  --bg: #fafafa;
+  --border: #e5e7eb;      /* slate-200 */
+}}
+
+body {{ background: var(--bg) !important; color: var(--text) !important; }}
+.container {{ max-width: 1080px !important; margin: auto !important; }}
+
+.banner {{
+  background: linear-gradient(95deg, var(--brand) 0%, #c0161f 70%, #d11a2a 100%);
+  color: #fff;
+  padding: 22px 22px;
+  border-radius: 14px;
+  margin-bottom: 16px;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.12);
+}}
+.banner h1 {{
+  margin: 0; font-size: 26px; font-weight: 700; letter-spacing: 0.3px;
+}}
+.banner p {{ margin: 8px 0 0 0; font-size: 14px; color: #f9fafb; }}
+
+.card {{
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 16px;
+  box-shadow: 0 10px 24px rgba(0,0,0,0.06);
+}}
+
+.summary-card .summary-head {{
+  display:flex; align-items:center; gap:12px; margin-bottom:8px;
+}}
+.summary-card .summary-title {{
+  margin:0; color: var(--text); font-size: 18px;
+}}
+.dot {{ width:12px; height:12px; border-radius:50%; display:inline-block; }}
+.summary-card .summary-body {{ color: var(--text); }}
+.summary-card .summary-body .line {{ margin: 6px 0; font-size: 16px; }}
+.summary-card .summary-body .code {{ opacity: .7; font-size: 14px; margin-left: 6px; }}
+.summary-card .summary-body .pill {{
+  display: inline-block; padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(0,0,0,0.06);
+  background: #f3f4f6;
+}}
+.summary-card .summary-body .note {{ margin-top: 10px; color: var(--text-muted); }}
+
+.gradio-container, .gradio-container * {{ color: var(--text); }}
+label, .label {{ color: var(--text) !important; }}
+.muted {{ color: var(--text-muted); }}
+
+.markdown-body, .gr-markdown p, .gr-markdown h1, .gr-markdown h2, .gr-markdown h3, .gr-markdown h4 {{
+  color: var(--text) !important;
+}}
+
+footer, .container footer * {{ color: var(--text-muted) !important; }}
+
+.input-card, .output-card {{ padding: 12px; }}
+
+.file-wrap .label, .gr-file .label {{ color: var(--text) !important; }}
+
+.dataframe-wrap .wrap {{ background: var(--card); border: 1px solid var(--border); border-radius: 12px; }}
+"""
 
 def build_gradio():
     with gr.Blocks(theme=gr.themes.Soft(primary_hue="red"),
-                   css="body{background:#ffffff;} .container{max-width:1080px; margin:auto;}") as demo:
+                   css=CUSTOM_CSS) as demo:
         gr.HTML(INTRO_HTML)
 
         with gr.Row():
@@ -187,11 +258,12 @@ def build_gradio():
                     file_types=[".png", ".jpg", ".jpeg"]
                 )
                 analyze_btn = gr.Button("🔍 Analyze Image", variant="primary")
-                gr.Markdown(DISCLAIMER)
+                gr.Markdown(f"<div class='card'>{DISCLAIMER}</div>")
             with gr.Column(scale=7):
-                result_title = gr.Markdown("")   # triage headline (kept)
-                result_body = gr.Markdown("")    # triage body (kept)
-                summary_card = gr.HTML("")       # NEW: prediction card
+                # keep your two markdowns, but they will inherit readable colors
+                result_title = gr.Markdown("")      # triage headline
+                result_body = gr.Markdown("")       # triage body
+                summary_card = gr.HTML("")          # prediction card (top class)
                 table = gr.Dataframe(
                     headers=["label (human)", "code", "probability (%)"],
                     row_count=7,
