@@ -1,6 +1,7 @@
 
 # Derma Scanner
 HAM10000-based demo. **Not** a medical device; **not** a diagnosis.
+Live app - https://huggingface.co/spaces/saketti/derma-scanner-v2
 
 # Derma Scanner — HAM10000 Skin Lesion Classifier
 
