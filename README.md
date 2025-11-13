@@ -36,7 +36,10 @@ HAM10000-based demo. **Not** a medical device; **not** a diagnosis.
 
 
 
-https://github.com/user-attachments/assets/495a8e43-f228-4846-9ac4-243848cc7971
+
+https://github.com/user-attachments/assets/cc98ad53-61d2-4f6e-9400-2c0e1e4d1460
+
+
 
 
 
